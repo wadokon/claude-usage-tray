@@ -1,0 +1,26 @@
+# vX.Y.Z タグを push すると exe をビルドして Release に添付する
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ClaudeUsageTray.exe
+        shell: cmd
+        run: >
+          %windir%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /codepage:65001
+          /target:winexe /out:ClaudeUsageTray.exe
+          /r:System.dll /r:System.Core.dll /r:System.Drawing.dll
+          /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll
+          ClaudeUsageTray.cs
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ClaudeUsageTray.exe

@@ -1,0 +1,15 @@
+# 個人設定・データ（絶対にコミットしない）
+widget-position.json
+tray-error.log
+poll-log.txt
+
+# ビルド成果物
+*.exe
+*.bak
+
+# ローカル専用メモ
+*.local.md
+
+# OS
+.DS_Store
+Thumbs.db
