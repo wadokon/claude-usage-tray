@@ -94,11 +94,46 @@ namespace ClaudeUsageTray
     {
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wp, IntPtr lp);
+        [DllImport("user32.dll")] static extern bool GetGestureInfo(IntPtr hGestureInfo, ref GestureInfo info);
+        [DllImport("user32.dll")] static extern bool CloseGestureInfoHandle(IntPtr hGestureInfo);
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct GestureInfo
+        {
+            public int cbSize;
+            public int dwFlags;
+            public int dwID;
+            public IntPtr hwndTarget;
+            public short x, y;
+            public int dwInstanceID;
+            public int dwSequenceID;
+            public long ullArguments;  // GID_ZOOM では2本の指の間隔
+            public int cbExtraArgs;
+        }
+
+        const int WM_MOUSEWHEEL = 0x020A;
+        const int WM_GESTURE = 0x0119;
+        const int MK_CONTROL = 0x0008;
+        const int GID_ZOOM = 3;
+        const int GF_BEGIN = 1;
+
+        // 以下は 100% のときの大きさ。描画時に表示倍率を掛ける
         const int RowH = 27;
         const int HeaderH = 20;
         const int PadTop = 8;
         const int WidgetW = 240;
+
+        // 表示倍率（%）。リモートデスクトップでスマホから見るときなどに大きくする
+        public static readonly int[] ZoomPresets = { 100, 125, 150, 200, 250, 300, 400 };
+        const int MinZoom = 100;
+        const int MaxZoom = 400;
+        const int ZoomStep = 25;  // Ctrl+ホイール1段あたり
+
+        int zoomPercent = 100;
+        int logicalH = 62;       // 100% のときの高さ（初期値は2行分）
+        int wheelDelta;          // 高精度タッチパッドは 120 未満の刻みで来るので貯めてから1段動かす
+        long pinchDistance;
+        int pinchZoom;
 
         public bool IsError;
         public string ErrorMessage = "";
@@ -127,7 +162,6 @@ namespace ClaudeUsageTray
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
-            ClientSize = new Size(WidgetW, 62);
             BackColor = Color.FromArgb(28, 28, 34);
             Opacity = 0.92;
             DoubleBuffered = true;
@@ -145,26 +179,53 @@ namespace ClaudeUsageTray
             ResizeEnd += delegate { SavePosition(); };
         }
 
+        public int ZoomPercent
+        {
+            get { return zoomPercent; }
+        }
+
+        float Zoom
+        {
+            get { return zoomPercent / 100f; }
+        }
+
+        int Px(int logical)
+        {
+            return (int)Math.Round(logical * Zoom);
+        }
+
         void LoadPosition()
         {
-            var wa = Screen.PrimaryScreen.WorkingArea;
-            var loc = new Point(wa.Right - Width, wa.Bottom - Height);
+            Point? saved = null;
             try
             {
                 if (File.Exists(posPath))
                 {
                     var ser = new JavaScriptSerializer();
                     var d = (Dictionary<string, object>)ser.DeserializeObject(File.ReadAllText(posPath));
-                    var saved = new Point(Convert.ToInt32(d["X"]), Convert.ToInt32(d["Y"]));
-                    // 画面構成が変わって画面外になっていた場合は既定位置に戻す
-                    foreach (var sc in Screen.AllScreens)
-                    {
-                        if (sc.WorkingArea.Contains(saved)) { loc = saved; break; }
-                    }
+                    saved = new Point(Convert.ToInt32(d["X"]), Convert.ToInt32(d["Y"]));
                     if (d.ContainsKey("TopMost")) AlwaysOnTop = Convert.ToBoolean(d["TopMost"]);
+                    if (d.ContainsKey("Zoom"))
+                        zoomPercent = Math.Max(MinZoom, Math.Min(MaxZoom, Convert.ToInt32(d["Zoom"])));
+                    // 前回の高さで始めないと、初回の FitToRows で上に伸びた分だけ保存位置より上にずれる
+                    if (d.ContainsKey("Height"))
+                        logicalH = Math.Max(PadTop + RowH, Math.Min(1000, Convert.ToInt32(d["Height"])));
                 }
             }
             catch { }
+
+            // 倍率が決まってから大きさと既定位置（プライマリ画面の右下）を決める
+            ClientSize = new Size(Px(WidgetW), Px(logicalH));
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            var loc = new Point(wa.Right - Width, wa.Bottom - Height);
+            // 画面構成が変わって画面外になっていた場合は既定位置に戻す
+            if (saved.HasValue)
+            {
+                foreach (var sc in Screen.AllScreens)
+                {
+                    if (sc.WorkingArea.Contains(saved.Value)) { loc = saved.Value; break; }
+                }
+            }
             Location = loc;
         }
 
@@ -173,8 +234,8 @@ namespace ClaudeUsageTray
             try
             {
                 File.WriteAllText(posPath, string.Format(
-                    "{{\"X\":{0},\"Y\":{1},\"TopMost\":{2}}}",
-                    Location.X, Location.Y, AlwaysOnTop ? "true" : "false"));
+                    "{{\"X\":{0},\"Y\":{1},\"TopMost\":{2},\"Zoom\":{3},\"Height\":{4}}}",
+                    Location.X, Location.Y, AlwaysOnTop ? "true" : "false", zoomPercent, logicalH));
             }
             catch { }
         }
@@ -185,10 +246,78 @@ namespace ClaudeUsageTray
             int h = PadTop;
             foreach (var row in Rows) h += row.Kind == RowKind.Header ? HeaderH : RowH;
             if (Rows.Count == 0) h += RowH;
-            if (ClientSize.Height == h) return;
-            int diff = h - ClientSize.Height;
-            ClientSize = new Size(WidgetW, h);
+            if (logicalH == h) return;
+            logicalH = h;
+            int diff = Px(h) - ClientSize.Height;
+            ClientSize = new Size(Px(WidgetW), Px(h));
             Top -= diff;
+        }
+
+        // 表示倍率を変える。作業領域の中での相対位置を保って伸び縮みさせる
+        public void SetZoom(int percent)
+        {
+            var old = Bounds;
+            var wa = Screen.FromRectangle(old).WorkingArea;
+            // スマホを画面にしているときなど、作業領域に収まらない倍率にはしない
+            int fit = (int)Math.Min(wa.Width * 100L / WidgetW, wa.Height * 100L / logicalH);
+            percent = Math.Max(MinZoom, Math.Min(Math.Min(MaxZoom, fit), percent));
+            if (percent == zoomPercent) return;
+            zoomPercent = percent;
+
+            int w = Px(WidgetW), h = Px(logicalH);
+            Bounds = new Rectangle(
+                KeepRelative(old.X, old.Width, w, wa.X, wa.Width),
+                KeepRelative(old.Y, old.Height, h, wa.Y, wa.Height), w, h);
+            Invalidate();
+            SavePosition();
+        }
+
+        // 作業領域の中での相対位置（左端/上端=0、右端/下端=1）を保ったまま大きさを変えたときの位置。
+        // 端に寄せてあれば端に付いたまま、倍率を戻せば元の位置に戻る
+        static int KeepRelative(int pos, int size, int newSize, int areaStart, int areaSize)
+        {
+            int room = areaSize - size;
+            double t = room > 0 ? Math.Max(0.0, Math.Min(1.0, (pos - areaStart) / (double)room)) : 0.0;
+            return areaStart + (int)Math.Round(Math.Max(0, areaSize - newSize) * t);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            // Ctrl+ホイール（高精度タッチパッドのピンチもこれで届く）で拡大縮小
+            if (m.Msg == WM_MOUSEWHEEL && (m.WParam.ToInt64() & MK_CONTROL) != 0)
+            {
+                wheelDelta += (short)(m.WParam.ToInt64() >> 16);
+                int steps = wheelDelta / 120;
+                if (steps != 0)
+                {
+                    wheelDelta -= steps * 120;
+                    SetZoom(zoomPercent + steps * ZoomStep);
+                }
+                return;
+            }
+
+            // タッチ画面のピンチ。開始時の指の間隔との比で倍率を決める（5% 刻み）
+            if (m.Msg == WM_GESTURE)
+            {
+                var gi = new GestureInfo();
+                gi.cbSize = Marshal.SizeOf(typeof(GestureInfo));
+                if (GetGestureInfo(m.LParam, ref gi) && gi.dwID == GID_ZOOM)
+                {
+                    if ((gi.dwFlags & GF_BEGIN) != 0)
+                    {
+                        pinchDistance = gi.ullArguments;
+                        pinchZoom = zoomPercent;
+                    }
+                    else if (pinchDistance > 0)
+                    {
+                        SetZoom((int)Math.Round(pinchZoom * gi.ullArguments / (double)pinchDistance / 5) * 5);
+                    }
+                    CloseGestureInfoHandle(m.LParam);
+                    return;
+                }
+            }
+
+            base.WndProc(ref m);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -197,6 +326,9 @@ namespace ClaudeUsageTray
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            // 100% のときの座標で描いて、表示倍率はまとめて掛ける
+            float z = Zoom;
+            g.ScaleTransform(z, z);
 
             using (var font = new Font("Segoe UI", 9f, FontStyle.Bold))
             using (var fontSmall = new Font("Segoe UI", 7.5f))
@@ -205,13 +337,15 @@ namespace ClaudeUsageTray
             using (var track = new SolidBrush(Color.FromArgb(60, 60, 70)))
             using (var border = new Pen(Color.FromArgb(70, 70, 82)))
             {
-                g.DrawRectangle(border, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+                // 拡大しても枠線が外周の内側にぴったり収まるようにずらす（100% のときは従来と同じ位置）
+                float inset = (z - 1) / (2 * z);
+                g.DrawRectangle(border, inset, inset, ClientSize.Width / z - 1, ClientSize.Height / z - 1);
 
                 if (IsError)
                 {
                     g.DrawString("取得エラー", font, dim, 12f, 10f);
                     g.DrawString(ErrorMessage, fontSmall, dim,
-                        new RectangleF(12f, 30f, ClientSize.Width - 24, ClientSize.Height - 34));
+                        new RectangleF(12f, 30f, WidgetW - 24, logicalH - 34));
                     return;
                 }
 
@@ -220,8 +354,8 @@ namespace ClaudeUsageTray
                 {
                     using (var warn = new SolidBrush(Color.FromArgb(245, 158, 11)))
                     {
-                        g.DrawString("!", font, warn, ClientSize.Width - 16, 1f);
-                        g.DrawString(StaleSince, fontSmall, warn, ClientSize.Width - 52, 3f);
+                        g.DrawString("!", font, warn, WidgetW - 16, 1f);
+                        g.DrawString(StaleSince, fontSmall, warn, WidgetW - 52, 3f);
                     }
                 }
 
@@ -231,21 +365,21 @@ namespace ClaudeUsageTray
                     if (row.Kind == RowKind.Header)
                     {
                         // 2つ目以降の見出しの上に区切り線を引く
-                        if (y > PadTop) g.DrawLine(border, 8, y + 1, ClientSize.Width - 9, y + 1);
+                        if (y > PadTop) g.DrawLine(border, 8, y + 1, WidgetW - 9, y + 1);
                         g.DrawString(row.Label, fontSmall, dim, 8f, y + 4);
                         if (!string.IsNullOrEmpty(row.Note))
                         {
                             using (var warn = new SolidBrush(Color.FromArgb(245, 158, 11)))
                             using (var right = new StringFormat { Alignment = StringAlignment.Far })
                                 g.DrawString(row.Note, fontSmall, warn,
-                                    new RectangleF(0, y + 4, ClientSize.Width - 8, HeaderH), right);
+                                    new RectangleF(0, y + 4, WidgetW - 8, HeaderH), right);
                         }
                         y += HeaderH;
                         continue;
                     }
                     if (row.Kind == RowKind.Message)
                     {
-                        g.DrawString(row.Label, fontSmall, dim, new RectangleF(8f, y + 2, ClientSize.Width - 16, RowH - 4));
+                        g.DrawString(row.Label, fontSmall, dim, new RectangleF(8f, y + 2, WidgetW - 16, RowH - 4));
                         y += RowH;
                         continue;
                     }
@@ -377,6 +511,16 @@ namespace ClaudeUsageTray
             };
             menu.Items.Add(miTopMost);
 
+            var miZoom = new ToolStripMenuItem("表示サイズ");
+            foreach (var p in WidgetForm.ZoomPresets)
+            {
+                int percent = p;
+                var mi = new ToolStripMenuItem(percent + "%", null, delegate { widget.SetZoom(percent); });
+                mi.Tag = percent;
+                miZoom.DropDownItems.Add(mi);
+            }
+            menu.Items.Add(miZoom);
+
             menu.Items.Add("詳細を表示", null, delegate
             {
                 notify.ShowBalloonTip(8000, BalloonTitle, lastDetail, ToolTipIcon.Info);
@@ -406,6 +550,10 @@ namespace ClaudeUsageTray
             {
                 miGptPage.Visible = gptEnabled;
                 miGptLogin.Visible = gptEnabled;
+                // Ctrl+ホイールやピンチで半端な倍率になっても分かるよう、今の倍率を項目名に出す
+                miZoom.Text = "表示サイズ (" + widget.ZoomPercent + "%)";
+                foreach (ToolStripMenuItem mi in miZoom.DropDownItems)
+                    mi.Checked = (int)mi.Tag == widget.ZoomPercent;
             };
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, delegate
